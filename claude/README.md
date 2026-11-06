@@ -128,6 +128,8 @@ stderr 仅保留最后 32 KiB，可显式读取 `Client.Stderr()` 或 `ProcessEr
 
 通过 `NewMCPServer` 创建服务，在其 `Server` 上使用官方 `github.com/modelcontextprotocol/go-sdk/mcp` 的 `AddTool`、资源和 prompt API 注册 Go 函数，然后填入 `Options.SDKServers`。普通 MCP server 仍使用 `MCPConfig`。工具参数的 JSON Schema 验证由官方 MCP SDK 完成。
 
+运行中可使用 `client.SetMCPServers(ctx, externalConfigs, sdkServers)` 替换动态配置。第三个参数是可选的 Go server map；省略则移除先前动态 SDK server。SDK 实例替换按 CLI 的移除/重新注册流程处理。原生 `ReadMCPResource` 控制只支持外部服务的 `ui://` 资源；SDK 内嵌服务由宿主直接访问，这是官方 CLI 的限制。
+
 `Options.SessionStore` 支持外部 transcript 存储；提供了 `NewInMemorySessionStore()` 供开发测试。接入的 adapter 实现 `Append` 和 `Load`，可选实现列表、删除和子路径枚举接口。镜像写入失败会产生 `system/mirror_error`。从 store 恢复时，会在私有临时目录还原 transcript，并在进程结束后删除；复用本机认证时移除复制凭据中的 refresh token，避免子进程消费原账户的刷新令牌。
 
 其他已暴露的上游配置包括 Agents、Skills、Plugins、Sandbox、Thinking/Effort、fallback model、系统提示词 preset/segments/snapshot 和文件 checkpointing。查看 [能力清单](COMPATIBILITY.md) 了解 API 对应关系、测试范围和差异。

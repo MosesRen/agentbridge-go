@@ -30,7 +30,7 @@ func Query(ctx context.Context, prompt string, options Options) (*Stream, error)
 		return nil, err
 	}
 	go func() {
-		if client.run.bidirectional {
+		if client.run.hasBidirectional() {
 			if client.run.wait(client.ctx) != nil {
 				return
 			}

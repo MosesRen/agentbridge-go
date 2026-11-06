@@ -30,6 +30,13 @@ func newRunTracker(o Options) *runTracker {
 		bidirectional: o.CanUseTool != nil || len(o.Hooks) > 0 || len(o.SDKServers) > 0 || o.OnElicitation != nil || o.OnUserDialog != nil || o.OnControlRequest != nil}
 }
 
+func (r *runTracker) hasBidirectional() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bidirectional
+}
+func (r *runTracker) requireBidirectional() { r.mu.Lock(); r.bidirectional = true; r.mu.Unlock() }
+
 func (r *runTracker) finishLocked() {
 	if !r.finished {
 		r.finished = true

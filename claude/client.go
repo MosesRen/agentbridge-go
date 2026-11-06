@@ -63,6 +63,8 @@ type Client struct {
 	hooks          map[string]hookRegistration
 	initRequest    map[string]any
 	bridgeMu       sync.Mutex
+	serverUpdateMu sync.Mutex
+	serverConfigs  map[string]json.RawMessage
 	bridges        map[string]*mcpBridge
 	run            *runTracker
 	inputClosed    atomic.Bool
@@ -97,6 +99,7 @@ func Dial(ctx context.Context, options Options) (*Client, error) {
 	c.run = newRunTracker(c.opts)
 	c.resumeCleanup = cleanup
 	c.initRequest = c.initializeRequest()
+	c.serverConfigs = initialMCPConfigs(opts)
 	if opts.Transport != nil {
 		c.stdout = &transportReader{ctx: c.ctx, transport: opts.Transport}
 		go c.readLoop()
@@ -157,6 +160,16 @@ func (c *Client) Initialization() json.RawMessage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return bytes.Clone(c.initialization)
+}
+
+func (c *Client) currentInitializeRequest() map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	request := make(map[string]any, len(c.initRequest))
+	for key, value := range c.initRequest {
+		request[key] = value
+	}
+	return request
 }
 
 func (c *Client) supervise() {

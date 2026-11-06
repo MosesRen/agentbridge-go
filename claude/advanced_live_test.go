@@ -56,6 +56,82 @@ func TestLiveHooksAndSDKMCP(t *testing.T) {
 	}
 }
 
+func TestLiveDynamicSDKMCP(t *testing.T) {
+	options := liveOptions(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := NewMCPServer("dynamic", "1")
+	server.Server.AddResource(&mcp.Resource{URI: "ui://fixture", Name: "fixture"}, func(context.Context, *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: "ui://fixture", MIMEType: "text/html;profile=mcp-app", Text: "dynamic resource"}}}, nil
+	})
+	if _, err = client.SetMCPServers(ctx, nil, map[string]*MCPServer{"dynamic": server}); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected := func() {
+		t.Helper()
+		for {
+			status, e := client.GetMCPStatus(ctx)
+			if e != nil {
+				t.Fatal(e)
+			}
+			connected := false
+			for _, item := range status.MCPServers {
+				if item.Name == "dynamic" {
+					if item.Status == "failed" {
+						t.Fatalf("dynamic MCP failed: %s", item.Error)
+					}
+					connected = item.Status == "connected"
+				}
+			}
+			if connected {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+	waitConnected()
+	result, err := client.mcpMessage(ctx, "dynamic", json.RawMessage(`{"jsonrpc":"2.0","id":"fixture-resource","method":"resources/read","params":{"uri":"ui://fixture"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(result), "dynamic resource") {
+		t.Fatalf("bad dynamic resource %s", result)
+	}
+	replacement := NewMCPServer("dynamic", "2")
+	replacement.Server.AddResource(&mcp.Resource{URI: "ui://fixture", Name: "fixture"}, func(context.Context, *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: "ui://fixture", MIMEType: "text/html;profile=mcp-app", Text: "replacement resource"}}}, nil
+	})
+	if _, err = client.SetMCPServers(ctx, nil, map[string]*MCPServer{"dynamic": replacement}); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected()
+	result, err = client.mcpMessage(ctx, "dynamic", json.RawMessage(`{"jsonrpc":"2.0","id":"fixture-resource-v2","method":"resources/read","params":{"uri":"ui://fixture"}}`))
+	if err != nil || !strings.Contains(string(result), "replacement resource") {
+		t.Fatalf("replacement result=%s err=%v", result, err)
+	}
+	if _, err = client.SetMCPServers(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	status, err := client.GetMCPStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range status.MCPServers {
+		if server.Name == "dynamic" {
+			t.Fatal("removed SDK server remains registered")
+		}
+	}
+}
+
 func TestLiveExternalStoreResume(t *testing.T) {
 	options := liveOptions(t)
 	options.MaxTurns = 1

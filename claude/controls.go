@@ -88,7 +88,7 @@ func (c *Client) AccountInfo() (AccountInfo, error) {
 	return r.Account, nil
 }
 func (c *Client) Reinitialize(ctx context.Context) (*InitializationResult, error) {
-	data, err := c.request(ctx, c.initRequest, c.opts.StartupTimeout)
+	data, err := c.request(ctx, c.currentInitializeRequest(), c.opts.StartupTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -206,8 +206,11 @@ func (c *Client) ToggleMCPServer(ctx context.Context, name string, enabled bool)
 func (c *Client) ReadMCPResource(ctx context.Context, name, uri string) (json.RawMessage, error) {
 	return c.control(ctx, "mcp_read_resource", map[string]any{"serverName": name, "uri": uri})
 }
-func (c *Client) SetMCPServers(ctx context.Context, servers map[string]json.RawMessage) (json.RawMessage, error) {
-	return c.control(ctx, "mcp_set_servers", map[string]any{"servers": servers})
+
+// SetMCPServers replaces dynamic external and optional in-process SDK servers.
+// Omitting the SDK map removes previous dynamic SDK servers, matching upstream.
+func (c *Client) SetMCPServers(ctx context.Context, servers map[string]json.RawMessage, sdkServers ...map[string]*MCPServer) (json.RawMessage, error) {
+	return c.setMCPServers(ctx, servers, sdkServers...)
 }
 func (c *Client) StopTask(ctx context.Context, id string) error {
 	_, err := c.control(ctx, "stop_task", map[string]any{"task_id": id})
@@ -315,7 +318,7 @@ func (c *Client) StreamInput(ctx context.Context, input <-chan UserMessage) erro
 			return ctx.Err()
 		case m, ok := <-input:
 			if !ok {
-				if c.run.bidirectional {
+				if c.run.hasBidirectional() {
 					if err := c.run.wait(ctx); err != nil {
 						return err
 					}

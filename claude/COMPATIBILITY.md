@@ -12,7 +12,7 @@ Go 运行时不依赖 Python 或 TypeScript SDK。官方 SDK 只用于开发时�
 | 权限回调和取消 | `CanUseTool`、原生控制请求取消 | 离线 |
 | Hooks | `Hooks`、`HookMatcher`、`HookCallback` | 离线、真实 CLI |
 | 进程内 MCP 工具、资源和 prompts | `SDKServers` + 官方 Go MCP SDK | schema/协议测试、真实工具调用 |
-| 外部 MCP、重连、启停和动态配置 | `MCPConfig`、`GetMCPStatus`、`ReconnectMCPServer`、`ToggleMCPServer`、`SetMCPServers` | 协议接口；动态配置方法尚无全面实测 |
+| 外部 MCP、重连、启停和动态配置 | `MCPConfig`、`GetMCPStatus`、`ReconnectMCPServer`、`ToggleMCPServer`、`SetMCPServers` | 动态 Go server 新增/替换/删除已实测，失败回滚有离线测试 |
 | elicitation / user dialogs | `OnElicitation`、`OnUserDialog`、`SupportedDialogKinds` | 原生协议接口，尚未真实服务联调 |
 | interrupt receipt / 取消队列消息 | `InterruptWithOptions`、`CancelAsyncMessage` | 基础 interrupt 已实测；队列 receipt 尚无全面实测 |
 | 模型、权限、thinking 和 settings 控制 | `SetModel`、`ResetModel`、`SetPermissionMode`、`SetMaxThinkingTokens`、`ApplyFlagSettings`、`UpdateSettings` | 部分真实控制实测；文件写入方法不在实测中调用 |
@@ -31,7 +31,6 @@ Go 运行时不依赖 Python 或 TypeScript SDK。官方 SDK 只用于开发时�
 - 消息保留完整 JSON；部分变化较快的控制响应和 event payload 使用 `json.RawMessage`，没有复制官方全部 TypeScript 类型定义。
 - 会话文件逻辑并非官方源码逐行翻译，复杂分支/压缩/并行工具历史尚未完成全面差异测试；不能宣称所有 transcript 边界情况完全一致。
 - SessionStore 采用逐帧写入，尚未提供官方的批量 flush/summary sidecar 优化 API。
-- 进程内 `SDKServers` 当前在 `Dial` 时注册；运行中 `SetMCPServers` 只更新外部 server 配置，尚未提供新增/替换 Go server 实例的高层接口。
 - Unix 进程组清理已测试。Windows 只终止直接 CLI 进程；Windows 运行验证依赖 CI，当前本机仅能交叉编译。
 
 ## 复现验证
