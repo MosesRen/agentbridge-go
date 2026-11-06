@@ -8,6 +8,7 @@ import (
 
 var (
 	ErrClosed          = errors.New("claude: client closed")
+	ErrInputClosed     = errors.New("claude: input stream closed")
 	ErrEventBufferFull = errors.New("claude: event buffer full; consume messages promptly or increase EventBuffer")
 	ErrMissingResult   = errors.New("claude: stream ended without a result")
 )

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"agentbridge-go/claude"
+	"github.com/MosesRen/agentbridge-go/claude"
 )
 
 func main() {

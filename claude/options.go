@@ -28,37 +28,76 @@ const (
 // Options configures a single Claude Code process. The zero value is usable.
 // Options and referenced maps/slices must not be mutated after Dial.
 type Options struct {
-	CLIPath                string // Defaults to claude on PATH. Must be an executable, not a shell command.
-	Dir                    string
-	Env                    map[string]string // Overrides the inherited environment. Never included in errors.
-	Model                  string
-	SystemPrompt           *string // nil keeps the CLI default; a pointer to "" replaces it with empty text.
-	AppendSystemPrompt     string
-	Tools                  []string // nil keeps defaults; an empty, non-nil slice disables built-in tools.
-	AllowedTools           []string
-	DisallowedTools        []string
-	PermissionMode         PermissionMode
-	MaxTurns               int
-	MaxBudgetUSD           float64
-	Resume                 string
-	SessionID              string
-	Continue               bool
-	ForkSession            bool
-	NoSessionPersistence   bool
-	IncludePartialMessages bool
-	SettingSources         []string // nil/empty loads no setting sources, matching SDK isolation.
-	AddDirs                []string
-	MCPConfig              json.RawMessage // Native {"mcpServers": {...}} configuration for external servers.
-	StrictMCPConfig        bool
-	JSONSchema             json.RawMessage
-	CanUseTool             PermissionHandler
-	StartupTimeout         time.Duration // Default 30s; bounds initialization, not model execution.
-	ControlTimeout         time.Duration // Default 30s; used when the request context has no earlier deadline.
-	CallbackTimeout        time.Duration // Default 30s; permission handlers must honor their context.
-	CloseTimeout           time.Duration // Default 2s before forcibly terminating the process tree.
-	MaxMessageBytes        int           // Default 8 MiB per JSONL record.
-	EventBuffer            int           // Default 256; overflow terminates the client rather than dropping events.
-	commandPrefix          []string      // Used by subprocess protocol tests.
+	CLIPath                 string    // Defaults to claude on PATH. Must be an executable, not a shell command.
+	Transport               Transport // Optional externally managed protocol transport; CLI flags are not applied to it.
+	Dir                     string
+	Env                     map[string]string // Overrides the inherited environment. Never included in errors.
+	Model                   string
+	SystemPrompt            *string // nil uses an empty SDK prompt, matching upstream. See UseClaudeCodePrompt.
+	AppendSystemPrompt      string
+	Tools                   []string // nil keeps defaults; an empty, non-nil slice disables built-in tools.
+	AllowedTools            []string
+	DisallowedTools         []string
+	PermissionMode          PermissionMode
+	MaxTurns                int
+	MaxBudgetUSD            float64
+	Resume                  string
+	SessionID               string
+	Continue                bool
+	ForkSession             bool
+	NoSessionPersistence    bool
+	IncludePartialMessages  bool
+	SettingSources          []string // nil follows upstream omission; an explicit empty slice sends an empty source list.
+	AddDirs                 []string
+	MCPConfig               json.RawMessage // Native {"mcpServers": {...}} configuration for external servers.
+	StrictMCPConfig         bool
+	JSONSchema              json.RawMessage
+	CanUseTool              PermissionHandler
+	UseClaudeCodePrompt     bool // Opt into the Claude Code preset instead of the empty SDK prompt.
+	SystemPromptFile        string
+	SystemPromptBlocks      []string // Native prompt segments, including the dynamic boundary marker.
+	SystemPromptSnapshot    *bool
+	ExcludeDynamicSections  *bool
+	FallbackModel           string
+	Agent                   string
+	Agents                  map[string]AgentDefinition
+	Betas                   []string
+	Settings                string // Inline JSON object or a settings file path.
+	Sandbox                 *SandboxSettings
+	Plugins                 []PluginConfig
+	Skills                  []string // nil: unspecified; non-nil: explicit skill allowlist, including empty.
+	AllSkills               bool
+	Thinking                *ThinkingConfig
+	Effort                  string
+	TaskBudget              int
+	BudgetLimit             *float64 // Explicit budget, including zero; overrides MaxBudgetUSD.
+	ResumeSessionAt         string
+	ResumeDropsTurn         *string
+	EnableFileCheckpointing bool
+	IncludeHookEvents       bool
+	ForwardSubagentText     bool
+	VerbatimPrompts         bool
+	Bare                    bool
+	Hooks                   map[HookEvent][]HookMatcher
+	SDKServers              map[string]*MCPServer
+	OnElicitation           ElicitationHandler
+	OnUserDialog            UserDialogHandler
+	OnControlRequest        ControlHandler     // Optional handler for newer server-initiated requests.
+	ExtraArgs               map[string]*string // Native flag names without '--'; nil means a boolean flag.
+	RunEndTimeout           time.Duration      // Default 10 minutes between background continuation turns; negative disables.
+	SessionStore            SessionStore
+	LoadTimeout             time.Duration // Default 60s for external store operations.
+	SupportedDialogKinds    []string
+	InitializeOptions       map[string]any // Additional native initialize fields; cannot override SDK-owned fields.
+	mergedSettings          string
+	mergedMCP               json.RawMessage
+	StartupTimeout          time.Duration // Default 60s; bounds initialization, not model execution.
+	ControlTimeout          time.Duration // Default 60s, bounded by the request context.
+	CallbackTimeout         time.Duration // Zero adds no host deadline; native hook deadlines still apply.
+	CloseTimeout            time.Duration // Default 2s before forcibly terminating the process tree.
+	MaxMessageBytes         int           // Default 8 MiB per JSONL record.
+	EventBuffer             int           // Default 0: unbounded. Positive values fail on overflow without dropping events.
+	commandPrefix           []string      // Used by subprocess protocol tests.
 }
 
 func (o Options) normalized() (Options, error) {
@@ -87,13 +126,10 @@ func (o Options) normalized() (Options, error) {
 		return o, fmt.Errorf("claude: unsupported permission mode %q", o.PermissionMode)
 	}
 	if o.StartupTimeout == 0 {
-		o.StartupTimeout = 30 * time.Second
+		o.StartupTimeout = 60 * time.Second
 	}
 	if o.ControlTimeout == 0 {
-		o.ControlTimeout = 30 * time.Second
-	}
-	if o.CallbackTimeout == 0 {
-		o.CallbackTimeout = 30 * time.Second
+		o.ControlTimeout = 60 * time.Second
 	}
 	if o.CloseTimeout == 0 {
 		o.CloseTimeout = 2 * time.Second
@@ -101,10 +137,7 @@ func (o Options) normalized() (Options, error) {
 	if o.MaxMessageBytes == 0 {
 		o.MaxMessageBytes = 8 << 20
 	}
-	if o.EventBuffer == 0 {
-		o.EventBuffer = 256
-	}
-	if o.StartupTimeout < 0 || o.ControlTimeout < 0 || o.CallbackTimeout < 0 || o.CloseTimeout < 0 || o.MaxMessageBytes < 1 || o.EventBuffer < 1 {
+	if o.StartupTimeout < 0 || o.ControlTimeout < 0 || o.CallbackTimeout < 0 || o.CloseTimeout < 0 || o.MaxMessageBytes < 1 || o.EventBuffer < 0 {
 		return o, fmt.Errorf("claude: timeouts and buffer sizes must be positive")
 	}
 	for key, value := range o.Env {
@@ -112,21 +145,24 @@ func (o Options) normalized() (Options, error) {
 			return o, fmt.Errorf("claude: invalid environment entry")
 		}
 	}
-	return o, nil
+	return o.extendedDefaults()
 }
 
 func (o Options) args() []string {
 	args := append([]string{}, o.commandPrefix...)
-	args = append(args, "--print", "--verbose", "--input-format=stream-json", "--output-format=stream-json", "--permission-prompt-tool=stdio", "--setting-sources="+strings.Join(o.SettingSources, ","))
+	args = append(args, "--print", "--verbose", "--input-format=stream-json", "--output-format=stream-json")
+	if o.CanUseTool != nil {
+		args = append(args, "--permission-prompt-tool=stdio")
+	}
 	add := func(flag, value string) { args = append(args, flag+"="+value) }
+	if o.SettingSources != nil {
+		add("--setting-sources", strings.Join(o.SettingSources, ","))
+	}
 	if o.Model != "" {
 		add("--model", o.Model)
 	}
-	if o.SystemPrompt != nil {
-		add("--system-prompt", *o.SystemPrompt)
-	}
-	if o.AppendSystemPrompt != "" {
-		add("--append-system-prompt", o.AppendSystemPrompt)
+	if o.SystemPromptFile != "" {
+		add("--system-prompt-file", o.SystemPromptFile)
 	}
 	if o.Tools != nil {
 		add("--tools", strings.Join(o.Tools, ","))
@@ -143,7 +179,9 @@ func (o Options) args() []string {
 	if o.MaxTurns > 0 {
 		add("--max-turns", strconv.Itoa(o.MaxTurns))
 	}
-	if o.MaxBudgetUSD > 0 {
+	if o.BudgetLimit != nil {
+		add("--max-budget-usd", strconv.FormatFloat(*o.BudgetLimit, 'f', -1, 64))
+	} else if o.MaxBudgetUSD > 0 {
 		add("--max-budget-usd", strconv.FormatFloat(o.MaxBudgetUSD, 'f', -1, 64))
 	}
 	if o.Resume != "" {
@@ -167,7 +205,9 @@ func (o Options) args() []string {
 	if o.StrictMCPConfig {
 		args = append(args, "--strict-mcp-config")
 	}
-	if len(o.MCPConfig) > 0 {
+	if len(o.mergedMCP) > 0 {
+		add("--mcp-config", string(o.mergedMCP))
+	} else if len(o.MCPConfig) > 0 {
 		add("--mcp-config", string(o.MCPConfig))
 	}
 	if len(o.JSONSchema) > 0 {
@@ -176,7 +216,7 @@ func (o Options) args() []string {
 	for _, dir := range o.AddDirs {
 		add("--add-dir", dir)
 	}
-	return args
+	return append(args, o.extendedArgs()...)
 }
 
 func (o Options) environment() []string {
@@ -194,6 +234,10 @@ func (o Options) environment() []string {
 		}
 	}
 	values["CLAUDE_CODE_ENTRYPOINT"] = "sdk-go"
+	values["CLAUDE_CODE_SDK_READS_SESSION_STATE"] = "1"
+	if o.EnableFileCheckpointing {
+		values["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true"
+	}
 	for key, value := range o.Env {
 		values[keyName(key)] = value
 	}

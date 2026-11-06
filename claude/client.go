@@ -29,9 +29,10 @@ type controlReply struct {
 }
 
 type writeJob struct {
-	data []byte
-	done chan error
-	ctx  context.Context
+	data     []byte
+	done     chan error
+	ctx      context.Context
+	endInput bool
 }
 
 // Client owns one CLI process and its native control protocol. Methods are safe
@@ -41,14 +42,14 @@ type Client struct {
 	opts           Options
 	cmd            *exec.Cmd
 	stdin          io.WriteCloser
-	stdout         *os.File
+	stdout         io.ReadCloser
 	ctx            context.Context
 	cancel         context.CancelCauseFunc
 	done           chan struct{}
 	exited         chan struct{}
 	readerDone     chan struct{}
 	writerDone     chan struct{}
-	events         chan Message
+	events         *messageQueue
 	writes         chan writeJob
 	seq            atomic.Uint64
 	mu             sync.Mutex
@@ -59,6 +60,13 @@ type Client struct {
 	err            error
 	stderr         tailBuffer
 	initialization json.RawMessage
+	hooks          map[string]hookRegistration
+	initRequest    map[string]any
+	bridgeMu       sync.Mutex
+	bridges        map[string]*mcpBridge
+	run            *runTracker
+	inputClosed    atomic.Bool
+	resumeCleanup  func()
 }
 
 // Dial starts Claude Code and completes the SDK initialize handshake. ctx owns
@@ -71,57 +79,85 @@ func Dial(ctx context.Context, options Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts, cleanup, err := materializeStoreResume(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			cleanup()
+		}
+	}()
 	processCtx, cancel := context.WithCancelCause(ctx)
 	c := &Client{opts: opts, ctx: processCtx, cancel: cancel,
 		done: make(chan struct{}), exited: make(chan struct{}), readerDone: make(chan struct{}), writerDone: make(chan struct{}),
-		events: make(chan Message, opts.EventBuffer), writes: make(chan writeJob),
-		pending: make(map[string]chan controlReply), callbacks: make(map[string]context.CancelFunc)}
-	c.cmd = exec.Command(opts.CLIPath, opts.args()...)
-	c.cmd.WaitDelay = opts.CloseTimeout
-	c.cmd.Dir, c.cmd.Env, c.cmd.Stderr = opts.Dir, opts.environment(), &c.stderr
-	prepareProcess(c.cmd)
-	c.stdin, err = c.cmd.StdinPipe()
-	if err != nil {
-		cancel(err)
-		return nil, fmt.Errorf("claude: create stdin: %w", err)
+		events: newMessageQueue(opts.EventBuffer), writes: make(chan writeJob),
+		pending: make(map[string]chan controlReply), callbacks: make(map[string]context.CancelFunc), bridges: make(map[string]*mcpBridge)}
+	c.run = newRunTracker(c.opts)
+	c.resumeCleanup = cleanup
+	c.initRequest = c.initializeRequest()
+	if opts.Transport != nil {
+		c.stdout = &transportReader{ctx: c.ctx, transport: opts.Transport}
+		go c.readLoop()
+		go c.writeLoop()
+		go c.superviseTransport()
+	} else {
+		c.cmd = exec.Command(opts.CLIPath, opts.args()...)
+		c.cmd.WaitDelay = opts.CloseTimeout
+		c.cmd.Dir, c.cmd.Env, c.cmd.Stderr = opts.Dir, opts.environment(), &c.stderr
+		prepareProcess(c.cmd)
+		c.stdin, err = c.cmd.StdinPipe()
+		if err != nil {
+			cancel(err)
+			return nil, fmt.Errorf("claude: create stdin: %w", err)
+		}
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			_ = c.stdin.Close()
+			cancel(err)
+			return nil, fmt.Errorf("claude: create stdout: %w", err)
+		}
+		c.stdout, c.cmd.Stdout = reader, writer
+		if err = c.cmd.Start(); err != nil {
+			_ = c.stdin.Close()
+			_ = reader.Close()
+			_ = writer.Close()
+			cancel(err)
+			return nil, fmt.Errorf("claude: start executable: %w", err)
+		}
+		_ = writer.Close() // Only the child keeps the stdout write end.
+		go c.readLoop()
+		go c.writeLoop()
+		go func() {
+			err := c.cmd.Wait()
+			c.mu.Lock()
+			c.waitErr = err
+			c.mu.Unlock()
+			close(c.exited)
+		}()
+		go c.supervise()
 	}
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		_ = c.stdin.Close()
-		cancel(err)
-		return nil, fmt.Errorf("claude: create stdout: %w", err)
-	}
-	c.stdout, c.cmd.Stdout = reader, writer
-	if err = c.cmd.Start(); err != nil {
-		_ = c.stdin.Close()
-		_ = reader.Close()
-		_ = writer.Close()
-		cancel(err)
-		return nil, fmt.Errorf("claude: start executable: %w", err)
-	}
-	_ = writer.Close() // Only the child keeps the stdout write end.
-	go c.readLoop()
-	go c.writeLoop()
-	go func() {
-		err := c.cmd.Wait()
-		c.mu.Lock()
-		c.waitErr = err
-		c.mu.Unlock()
-		close(c.exited)
-	}()
-	go c.supervise()
 	initCtx, stop := context.WithTimeout(ctx, opts.StartupTimeout)
 	defer stop()
-	c.initialization, err = c.Request(initCtx, map[string]any{"subtype": "initialize", "hooks": nil})
+	c.initialization, err = c.request(initCtx, c.initRequest, opts.StartupTimeout)
+	if err == nil {
+		err = c.checkInitialization(c.initialization)
+	}
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("claude: initialize: %w", err)
 	}
+	success = true
 	return c, nil
 }
 
 // Initialization returns the raw server capabilities received during Dial.
-func (c *Client) Initialization() json.RawMessage { return bytes.Clone(c.initialization) }
+func (c *Client) Initialization() json.RawMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return bytes.Clone(c.initialization)
+}
 
 func (c *Client) supervise() {
 	select {
@@ -170,13 +206,16 @@ func (c *Client) supervise() {
 	}
 	c.mu.Unlock()
 	c.cancel(ErrClosed)
+	c.run.close()
+	c.closeMCP()
+	c.resumeCleanup()
 	<-c.writerDone
 	close(c.done)
 }
 
 func (c *Client) readLoop() {
 	defer close(c.readerDone)
-	defer close(c.events)
+	defer c.events.close()
 	scanner := bufio.NewScanner(c.stdout)
 	scanner.Buffer(make([]byte, min(4096, c.opts.MaxMessageBytes)), c.opts.MaxMessageBytes)
 	var readErr error
@@ -215,7 +254,14 @@ func (c *Client) readLoop() {
 			if cancel != nil {
 				cancel()
 			}
-		case "keep_alive":
+		case "transcript_mirror":
+			if err := c.mirror(line); err != nil {
+				data, _ := json.Marshal(map[string]any{"type": "system", "subtype": "mirror_error", "error": "session store append failed"})
+				if err := c.events.push(Message{Type: "system", Subtype: "mirror_error", Raw: data}); err != nil {
+					readErr = err
+				}
+			}
+		case "keep_alive", "keep-alive", "keep_alive_ping":
 		default:
 			var message Message
 			if err := json.Unmarshal(line, &message); err != nil {
@@ -223,12 +269,11 @@ func (c *Client) readLoop() {
 				break
 			}
 			message.Raw = bytes.Clone(line)
-			select {
-			case c.events <- message:
-			case <-c.ctx.Done():
-				return
-			default:
-				readErr = ErrEventBufferFull
+			if !c.run.observe(message) {
+				continue
+			}
+			if err := c.events.push(message); err != nil {
+				readErr = err
 			}
 		}
 		if readErr != nil {
@@ -257,7 +302,19 @@ func (c *Client) writeLoop() {
 		case job := <-c.writes:
 			err := job.ctx.Err()
 			if err == nil {
-				_, err = c.stdin.Write(job.data)
+				if c.opts.Transport != nil {
+					if job.endInput {
+						err = c.opts.Transport.EndInput(job.ctx)
+						c.inputClosed.Store(true)
+					} else {
+						err = c.opts.Transport.Write(job.ctx, bytes.TrimSuffix(job.data, []byte{'\n'}))
+					}
+				} else if job.endInput {
+					err = c.stdin.Close()
+					c.inputClosed.Store(true)
+				} else {
+					_, err = c.stdin.Write(job.data)
+				}
 			}
 			job.done <- err
 			if err != nil && job.ctx.Err() == nil {
@@ -274,6 +331,9 @@ func (c *Client) write(ctx context.Context, value any) error {
 	}
 	if c.ctx.Err() != nil {
 		return c.closedError()
+	}
+	if c.inputClosed.Load() {
+		return ErrInputClosed
 	}
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -311,58 +371,84 @@ func (c *Client) closedError() error {
 // Send queues a plain text user message. Returning successfully only confirms
 // the write; read through a result message to observe turn completion.
 func (c *Client) Send(ctx context.Context, prompt string) error {
-	content, _ := json.Marshal(prompt)
+	content, _ := json.Marshal([]ContentBlock{{Type: "text", Text: prompt}})
 	return c.SendMessage(ctx, UserMessage{Content: content})
 }
 
 func (c *Client) SendMessage(ctx context.Context, message UserMessage) error {
+	for key := range message.Extra {
+		switch key {
+		case "type", "message", "session_id", "parent_tool_use_id", "uuid", "client_composed", "priority", "shouldQuery", "agent_id", "subagent_type", "task_description":
+			return fmt.Errorf("claude: Extra cannot override %s", key)
+		}
+	}
+	if message.Priority != "" && message.Priority != "now" && message.Priority != "next" && message.Priority != "later" {
+		return fmt.Errorf("claude: invalid user message priority")
+	}
 	content := bytes.TrimSpace(message.Content)
 	if !json.Valid(content) || len(content) == 0 || (content[0] != '"' && content[0] != '[') {
 		return fmt.Errorf("claude: user content must be a JSON string or array")
 	}
-	return c.write(ctx, struct {
-		Type    string `json:"type"`
-		Message struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"message"`
-		SessionID       string  `json:"session_id"`
-		ParentToolUseID *string `json:"parent_tool_use_id"`
-		UUID            string  `json:"uuid,omitempty"`
-	}{Type: "user", Message: struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}{"user", content},
-		SessionID: message.SessionID, ParentToolUseID: message.ParentToolUseID, UUID: message.UUID})
+	if message.UUID == "" {
+		var err error
+		message.UUID, err = newUUID()
+		if err != nil {
+			return err
+		}
+	}
+	tracked := message.ParentToolUseID == nil && message.AgentID == "" && (message.ShouldQuery == nil || *message.ShouldQuery)
+	if tracked {
+		c.run.sent(message.UUID)
+	}
+	wire := map[string]any{}
+	for key, value := range message.Extra {
+		wire[key] = value
+	}
+	wire["type"] = "user"
+	wire["message"] = map[string]any{"role": "user", "content": content}
+	wire["session_id"] = message.SessionID
+	wire["parent_tool_use_id"] = message.ParentToolUseID
+	wire["uuid"] = message.UUID
+	if c.opts.VerbatimPrompts {
+		wire["client_composed"] = true
+	}
+	if message.Priority != "" {
+		wire["priority"] = message.Priority
+	}
+	if message.ShouldQuery != nil {
+		wire["shouldQuery"] = *message.ShouldQuery
+	}
+	if message.AgentID != "" {
+		wire["agent_id"] = message.AgentID
+	}
+	if message.SubagentType != "" {
+		wire["subagent_type"] = message.SubagentType
+	}
+	if message.TaskDescription != "" {
+		wire["task_description"] = message.TaskDescription
+	}
+	err := c.write(ctx, wire)
+	if err != nil && tracked {
+		c.run.unsent(message.UUID)
+	}
+	return err
 }
 
 // Receive returns the next native message. Canceling ctx does not interrupt a
 // turn or terminate the process. On process exit it drains queued messages first.
 func (c *Client) Receive(ctx context.Context) (Message, error) {
-	if err := ctx.Err(); err != nil {
-		return Message{}, err
-	}
-	select {
-	case message, ok := <-c.events:
-		if ok {
-			return message, nil
-		}
-		select {
-		case <-c.done:
-			return Message{}, c.closedError()
-		case <-ctx.Done():
-			return Message{}, ctx.Err()
-		}
-	case <-ctx.Done():
-		return Message{}, ctx.Err()
-	}
+	return c.events.pop(ctx, c.done, c.closedError)
 }
 
 // Request sends a native SDK control request object, including its subtype, and
 // correlates the response by ID. New CLI controls can be used without SDK changes.
 // Canceling ctx stops waiting; it does not undo an already sent request.
 func (c *Client) Request(ctx context.Context, request any) (json.RawMessage, error) {
-	ctx, stop := context.WithTimeout(ctx, c.opts.ControlTimeout)
+	return c.request(ctx, request, c.opts.ControlTimeout)
+}
+
+func (c *Client) request(ctx context.Context, request any, timeout time.Duration) (json.RawMessage, error) {
+	ctx, stop := context.WithTimeout(ctx, timeout)
 	defer stop()
 	id := "go_" + strconv.FormatUint(c.seq.Add(1), 10)
 	ch := make(chan controlReply, 1)
@@ -387,6 +473,29 @@ func (c *Client) Request(ctx context.Context, request any) (json.RawMessage, err
 		return nil, ctx.Err()
 	case <-c.done:
 		return nil, c.closedError()
+	}
+}
+
+// EndInput closes stdin after preceding writes; output continues until CLI exit.
+func (c *Client) EndInput(ctx context.Context) error {
+	if c.inputClosed.Load() {
+		return nil
+	}
+	job := writeJob{ctx: ctx, done: make(chan error, 1), endInput: true}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return c.closedError()
+	case c.writes <- job:
+	}
+	select {
+	case err := <-job.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return c.closedError()
 	}
 }
 
@@ -440,12 +549,26 @@ func (c *Client) Wait(ctx context.Context) error {
 func (c *Client) Stderr() string { return c.stderr.String() }
 
 func (c *Client) dispatchPermission(id string, raw json.RawMessage) {
-	ctx, cancel := context.WithTimeout(c.ctx, c.opts.CallbackTimeout)
+	duration := c.opts.CallbackTimeout
+	var request struct {
+		Subtype    string `json:"subtype"`
+		CallbackID string `json:"callback_id"`
+	}
+	_ = json.Unmarshal(raw, &request)
+	if request.Subtype == "hook_callback" {
+		if hook, ok := c.hooks[request.CallbackID]; ok && hook.timeout > 0 && (duration == 0 || hook.timeout < duration) {
+			duration = hook.timeout
+		}
+	}
+	ctx, cancel := context.WithCancel(c.ctx)
+	if duration > 0 {
+		cancel()
+		ctx, cancel = context.WithTimeout(c.ctx, duration)
+	}
 	c.mu.Lock()
-	if _, exists := c.callbacks[id]; exists || len(c.callbacks) >= 32 {
+	if _, exists := c.callbacks[id]; exists {
 		c.mu.Unlock()
 		cancel()
-		c.cancel(errors.New("claude: duplicate or excessive server control requests"))
 		return
 	}
 	c.callbacks[id] = cancel
@@ -456,11 +579,11 @@ func (c *Client) dispatchPermission(id string, raw json.RawMessage) {
 		// Run user code separately so a context-ignoring callback cannot hold the
 		// protocol open forever. Such callbacks remain the caller's responsibility.
 		type outcome struct {
-			decision PermissionDecision
+			decision any
 			err      error
 		}
 		completed := make(chan outcome, 1)
-		go func() { decision, err := c.permission(ctx, raw); completed <- outcome{decision, err} }()
+		go func() { decision, err := c.serverControl(ctx, raw); completed <- outcome{decision, err} }()
 		var result outcome
 		select {
 		case result = <-completed:
@@ -481,7 +604,7 @@ func (c *Client) dispatchPermission(id string, raw json.RawMessage) {
 		}
 		response := map[string]any{"subtype": "success", "request_id": id, "response": result.decision}
 		if result.err != nil {
-			response = map[string]any{"subtype": "error", "request_id": id, "error": "host permission handler failed"}
+			response = map[string]any{"subtype": "error", "request_id": id, "error": "host control handler failed"}
 		}
 		writeCtx, stop := context.WithTimeout(c.ctx, c.opts.ControlTimeout)
 		defer stop()

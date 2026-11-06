@@ -2,7 +2,7 @@
 
 通过本机 Claude Code CLI，提供 Go 风格的单次查询、流式响应和长驻多轮客户端。使用 Claude 原生 SDK 控制协议，不依赖 Python 或 TypeScript SDK。
 
-此模块是非官方实现。需要 Go 1.23+ 和可执行的 `claude`；也可通过 `Options.CLIPath` 指定 CLI 可执行文件或带 shebang 的启动脚本。该字段不接受 shell 命令字符串，也不直接执行 Windows `.cmd` 文件。SDK 不下载 CLI，不管理登录和凭据。
+此模块是非官方实现。兼容基准为 TypeScript SDK 0.3.318 / CLI 2.1.318，需要 Go 1.25+ 和可执行的 `claude`。通过 `Options.CLIPath` 指定 CLI 可执行文件或带 shebang 的脚本；该字段不接受 shell 命令字符串或 Windows `.cmd` 文件。SDK 不自动下载 CLI，不管理登录流程。
 
 ## 单次查询
 
@@ -15,7 +15,7 @@ import (
     "log"
     "time"
 
-    "agentbridge-go/claude"
+    "github.com/MosesRen/agentbridge-go/claude"
 )
 
 func main() {
@@ -32,7 +32,7 @@ func main() {
 }
 ```
 
-`Run` 消费消息直到第一个前台 `result`，随后关闭进程。失败结果会同时返回非 nil 的 `*Result` 和 `*ResultError`。如果任务会启动后台 agent，并需要继续接收其后续事件，应使用 `Dial`，自行决定结束时间。
+`Run` 消费整个单次运行，包括后台 agent 引发的后续轮次，最后返回最终 `result`。失败结果同时返回非 nil 的 `*Result` 和 `*ResultError`。运行结束判定跟随 CLI session state 和 agent task 生命周期；长驻 shell/monitor 不阻止运行结束。需要自行安排多轮交互时使用 `Dial`。
 
 ## 流式查询
 
@@ -49,7 +49,6 @@ for {
     if message.Type == "assistant" {
         fmt.Print(message.Text())
     }
-    if message.Type == "result" { break }
 }
 result, err := stream.Result(ctx)
 ```
@@ -82,7 +81,7 @@ err = client.Send(ctx, "Now suggest a fix.")
 
 控制方法包括 `Interrupt`、`SetModel`、`SetPermissionMode`。`Request` 可以发送包含 `subtype` 的原生控制对象；响应按 request ID 关联，允许多个并发控制请求。`Initialization()` 返回握手时的原始能力信息。
 
-`Options.Resume`、`Continue`、`SessionID` 和 `ForkSession` 用于新进程的会话启动方式；`Resume`、`Continue`、`SessionID` 三者互斥，`ForkSession` 必须搭配恢复或继续。SDK 不自行操作磁盘上的会话文件。
+`Options.Resume`、`Continue`、`SessionID` 和 `ForkSession` 配置新进程的会话启动方式；前三者互斥，`ForkSession` 搭配恢复或继续。独立的 `ListSessions`、`GetSessionInfo`、`GetSessionMessages`、`RenameSession`、`TagSession`、`DeleteSession`、`ForkSession` 以及子 Agent 查询函数用于管理已保存的会话。
 
 ## 权限回调
 
@@ -112,26 +111,30 @@ options.CanUseTool = func(ctx context.Context, req claude.PermissionRequest) (cl
 | `Interrupt(ctx)` | 请求中断当前执行，进程继续存活 |
 | `Close()` | 幂等；终止并回收 SDK 创建的进程 |
 | `Wait(ctx)` | 等待进程回收，返回进程错误或生命周期取消原因 |
-| `SettingSources` | 默认空；可显式启用 `user`、`project`、`local` |
+| `SettingSources` | nil 省略参数；空但非 nil 切片显式传空；可启用 `user`、`project`、`local` |
 | `Tools` | nil 保留 CLI 默认工具，空但非 nil 切片关闭全部内置工具 |
 | `Env` | 在继承环境上覆盖；默认移除嵌套运行标记 `CLAUDECODE` |
 | `MCPConfig` | 外部 MCP server 的原生 JSON 配置；可搭配 `StrictMCPConfig` |
 
 Unix 上每个客户端建立独立进程组：关闭时先发 SIGTERM，默认等待 2 秒，再用 SIGKILL 清理进程组。其他平台目前只终止直接子进程，尚未实现 Windows Job Object。调用方必须 `Close()`；父 Go 进程被强杀时，没有退出钩子保证自动清理。
 
-默认每条消息最多 8 MiB，事件队列容量为 256。超出大小或队列容量时客户端返回错误并关闭，不静默丢消息。增加 `MaxMessageBytes` / `EventBuffer` 可调整限制。使用单一逻辑消息消费者；控制请求与审批处理不依赖应用层消息消费。
+默认每条消息最多 8 MiB，事件队列不设数量上限。可显式设置正值 `EventBuffer`，超出容量时返回错误并关闭，不静默丢消息。使用单一逻辑消息消费者；控制请求与审批处理不依赖应用层消息消费。初始化和普通控制请求默认超时为 60 秒；回调默认仅受原生取消请求和 Hook 自身超时控制。
 
 stderr 仅保留最后 32 KiB，可显式读取 `Client.Stderr()` 或 `ProcessError.Stderr`；格式化错误不会自动输出 stderr，避免意外泄露诊断中的敏感信息。
 
-## 第一版范围
+## Hooks、MCP 和 SessionStore
 
-已实现：查询和多轮会话、原生流式事件、审批回调、恢复/分叉参数、结构化与多模态消息输入、外部 MCP 配置、模型/权限控制、中断、进程回收。
+`Options.Hooks` 注册 Go 回调，输入的 `Raw` 和输出的 `HookOutput` 保留原生 Hook 协议。`OnFailure: "block"` 会检查 CLI 是否支持并已应用阻断语义；不支持时初始化报错。
 
-暂未实现：Go hooks 注册、进程内 MCP 工具注册、SDK 会话文件管理、后台任务自动完成判定、CLI 自动安装、Windows 进程树回收。原生控制协议不是稳定的公共 HTTP API，需要跟随 Claude CLI 版本维护。
+通过 `NewMCPServer` 创建服务，在其 `Server` 上使用官方 `github.com/modelcontextprotocol/go-sdk/mcp` 的 `AddTool`、资源和 prompt API 注册 Go 函数，然后填入 `Options.SDKServers`。普通 MCP server 仍使用 `MCPConfig`。工具参数的 JSON Schema 验证由官方 MCP SDK 完成。
+
+`Options.SessionStore` 支持外部 transcript 存储；提供了 `NewInMemorySessionStore()` 供开发测试。接入的 adapter 实现 `Append` 和 `Load`，可选实现列表、删除和子路径枚举接口。镜像写入失败会产生 `system/mirror_error`。从 store 恢复时，会在私有临时目录还原 transcript，并在进程结束后删除；复用本机认证时移除复制凭据中的 refresh token，避免子进程消费原账户的刷新令牌。
+
+其他已暴露的上游配置包括 Agents、Skills、Plugins、Sandbox、Thinking/Effort、fallback model、系统提示词 preset/segments/snapshot 和文件 checkpointing。查看 [能力清单](COMPATIBILITY.md) 了解 API 对应关系、测试范围和差异。
 
 ## 验证记录
 
-本机 macOS arm64、Go 1.27.3、Claude Code 2.1.158 下，已使用现有用户配置验证单次查询、partial streaming、多轮上下文记忆、权限模式切换及中断控制。审批回调、错误路径、超时、并发控制请求和 Unix 进程树清理由离线子进程测试覆盖。
+本机 macOS arm64、Go 1.27.3、Claude Code 2.1.318 下，已验证查询、partial streaming、多轮记忆、权限模式切换、中断、Go Hooks、进程内 MCP 工具调用和外部 SessionStore 恢复。另有官方 TypeScript SDK 与 Go SDK 共用模拟 CLI 的差异测试。审批和错误路径、后台轮次跟踪、并发控制、会话文件变换及进程回收由离线测试覆盖。
 
 ```sh
 go test -race ./...
@@ -142,5 +145,4 @@ go vet ./...
 
 - [官方 SDK 概览](https://code.claude.com/docs/en/agent-sdk/overview)
 - [官方流式输入说明](https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode)
-- [官方 Python 子进程 transport 实现](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py)
-- [官方 Python 控制协议实现](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py)
+- [官方 TypeScript SDK 0.3.318](https://github.com/anthropics/claude-agent-sdk-typescript/releases/tag/v0.3.318)

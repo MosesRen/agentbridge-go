@@ -20,6 +20,7 @@ func TestLiveCLI(t *testing.T) {
 	defer cancel()
 	dir := t.TempDir()
 	options := Options{Dir: dir, Tools: []string{}, StrictMCPConfig: true,
+		CLIPath:   os.Getenv("AGENTBRIDGE_CLAUDE_PATH"),
 		MCPConfig: json.RawMessage(`{"mcpServers":{}}`), NoSessionPersistence: true,
 		SettingSources: []string{"user"}, MaxTurns: 1, MaxBudgetUSD: 0.20, IncludePartialMessages: true}
 	t.Run("query", func(t *testing.T) {

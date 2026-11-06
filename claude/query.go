@@ -6,7 +6,8 @@ import (
 	"io"
 )
 
-// Stream owns a one-turn client. Next and Result must be called by one consumer.
+// Stream owns a one-shot run, including background continuation turns.
+// Next and Result must be called by one consumer.
 // Close the stream even if iteration stops early. For background work or queued
 // prompts, use Dial and decide when to close the persistent client yourself.
 type Stream struct {
@@ -16,8 +17,9 @@ type Stream struct {
 	err    error
 }
 
-// Query starts a process and sends one prompt. The stream ends at its first
-// result envelope; Close terminates any remaining background agent work.
+// Query starts a process and sends one prompt. It closes input once the run
+// settles and yields output through process exit, including continuation turns.
+// Close aborts any remaining work.
 func Query(ctx context.Context, prompt string, options Options) (*Stream, error) {
 	client, err := Dial(ctx, options)
 	if err != nil {
@@ -27,6 +29,20 @@ func Query(ctx context.Context, prompt string, options Options) (*Stream, error)
 		_ = client.Close()
 		return nil, err
 	}
+	go func() {
+		if client.run.bidirectional {
+			if client.run.wait(client.ctx) != nil {
+				return
+			}
+		}
+		if err := client.EndInput(client.ctx); err != nil && client.ctx.Err() == nil {
+			select {
+			case <-client.exited:
+			default:
+				client.cancel(err)
+			}
+		}
+	}()
 	return &Stream{client: client}, nil
 }
 
@@ -44,24 +60,38 @@ func (s *Stream) Next(ctx context.Context) (Message, error) {
 			return Message{}, err
 		}
 		if errors.Is(err, io.EOF) {
-			err = ErrMissingResult
+			if s.result == nil {
+				err = ErrMissingResult
+			} else {
+				err = s.err
+			}
+		} else if s.result != nil && s.err != nil {
+			var process *ProcessError
+			if errors.As(err, &process) {
+				err = s.err
+			}
 		}
 		s.ended, s.err = true, err
+		if err == nil {
+			return Message{}, io.EOF
+		}
 		return Message{}, err
 	}
 	if message.Type == "result" {
 		s.result, s.err = message.Result()
-		s.ended = true
 	}
 	return message, nil
 }
 
-// Result consumes remaining messages and returns the first turn's result. Agent
+// Result consumes remaining messages and returns the final turn's result. Agent
 // failures return both a Result and a *ResultError, even if CLI exit status is 0.
 func (s *Stream) Result(ctx context.Context) (*Result, error) {
 	for !s.ended {
 		if _, err := s.Next(ctx); err != nil {
-			return nil, err
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return s.result, err
 		}
 	}
 	return s.result, s.err
