@@ -1,0 +1,551 @@
+package claude
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// PermissionHandler decides requests that reach the host. CLI allow/deny rules
+// may resolve a tool call before this callback runs. Handlers run concurrently,
+// must respect ctx, and may call client control methods (but must not call Close).
+type PermissionHandler func(ctx context.Context, request PermissionRequest) (PermissionDecision, error)
+
+type controlReply struct {
+	Subtype   string          `json:"subtype"`
+	RequestID string          `json:"request_id"`
+	Response  json.RawMessage `json:"response"`
+	Error     string          `json:"error"`
+}
+
+type writeJob struct {
+	data []byte
+	done chan error
+	ctx  context.Context
+}
+
+// Client owns one CLI process and its native control protocol. Methods are safe
+// for concurrent use; use one logical Receive consumer to preserve stream order.
+// Send can queue turns; Receive exposes their messages in CLI order.
+type Client struct {
+	opts           Options
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	stdout         *os.File
+	ctx            context.Context
+	cancel         context.CancelCauseFunc
+	done           chan struct{}
+	exited         chan struct{}
+	readerDone     chan struct{}
+	writerDone     chan struct{}
+	events         chan Message
+	writes         chan writeJob
+	seq            atomic.Uint64
+	mu             sync.Mutex
+	pending        map[string]chan controlReply
+	callbacks      map[string]context.CancelFunc
+	readErr        error
+	waitErr        error
+	err            error
+	stderr         tailBuffer
+	initialization json.RawMessage
+}
+
+// Dial starts Claude Code and completes the SDK initialize handshake. ctx owns
+// the process lifetime. Initialization failures terminate and reap the child.
+func Dial(ctx context.Context, options Options) (*Client, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	opts, err := options.normalized()
+	if err != nil {
+		return nil, err
+	}
+	processCtx, cancel := context.WithCancelCause(ctx)
+	c := &Client{opts: opts, ctx: processCtx, cancel: cancel,
+		done: make(chan struct{}), exited: make(chan struct{}), readerDone: make(chan struct{}), writerDone: make(chan struct{}),
+		events: make(chan Message, opts.EventBuffer), writes: make(chan writeJob),
+		pending: make(map[string]chan controlReply), callbacks: make(map[string]context.CancelFunc)}
+	c.cmd = exec.Command(opts.CLIPath, opts.args()...)
+	c.cmd.WaitDelay = opts.CloseTimeout
+	c.cmd.Dir, c.cmd.Env, c.cmd.Stderr = opts.Dir, opts.environment(), &c.stderr
+	prepareProcess(c.cmd)
+	c.stdin, err = c.cmd.StdinPipe()
+	if err != nil {
+		cancel(err)
+		return nil, fmt.Errorf("claude: create stdin: %w", err)
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		_ = c.stdin.Close()
+		cancel(err)
+		return nil, fmt.Errorf("claude: create stdout: %w", err)
+	}
+	c.stdout, c.cmd.Stdout = reader, writer
+	if err = c.cmd.Start(); err != nil {
+		_ = c.stdin.Close()
+		_ = reader.Close()
+		_ = writer.Close()
+		cancel(err)
+		return nil, fmt.Errorf("claude: start executable: %w", err)
+	}
+	_ = writer.Close() // Only the child keeps the stdout write end.
+	go c.readLoop()
+	go c.writeLoop()
+	go func() {
+		err := c.cmd.Wait()
+		c.mu.Lock()
+		c.waitErr = err
+		c.mu.Unlock()
+		close(c.exited)
+	}()
+	go c.supervise()
+	initCtx, stop := context.WithTimeout(ctx, opts.StartupTimeout)
+	defer stop()
+	c.initialization, err = c.Request(initCtx, map[string]any{"subtype": "initialize", "hooks": nil})
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("claude: initialize: %w", err)
+	}
+	return c, nil
+}
+
+// Initialization returns the raw server capabilities received during Dial.
+func (c *Client) Initialization() json.RawMessage { return bytes.Clone(c.initialization) }
+
+func (c *Client) supervise() {
+	select {
+	case <-c.ctx.Done():
+		signalProcess(c.cmd, false)
+		timer := time.NewTimer(c.opts.CloseTimeout)
+		select {
+		case <-c.exited:
+		case <-timer.C:
+			signalProcess(c.cmd, true)
+			<-c.exited
+		}
+		timer.Stop()
+		// A terminated parent can leave descendants holding inherited pipe ends.
+		signalProcess(c.cmd, true)
+		_ = c.stdout.Close()
+	case <-c.exited:
+		// Drain final records, but do not hang on a descendant retaining stdout.
+		timer := time.NewTimer(c.opts.CloseTimeout)
+		select {
+		case <-c.readerDone:
+		case <-c.ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		signalProcess(c.cmd, true)
+		_ = c.stdout.Close()
+	}
+	_ = c.stdin.Close()
+	<-c.readerDone
+	c.mu.Lock()
+	switch {
+	case c.readErr != nil:
+		c.err = c.readErr
+	case context.Cause(c.ctx) != nil:
+		c.err = context.Cause(c.ctx)
+	case c.waitErr != nil:
+		code := -1
+		var exit *exec.ExitError
+		if errors.As(c.waitErr, &exit) {
+			code = exit.ExitCode()
+		}
+		c.err = &ProcessError{ExitCode: code, Stderr: c.stderr.String(), Err: c.waitErr}
+	default:
+		c.err = io.EOF
+	}
+	c.mu.Unlock()
+	c.cancel(ErrClosed)
+	<-c.writerDone
+	close(c.done)
+}
+
+func (c *Client) readLoop() {
+	defer close(c.readerDone)
+	defer close(c.events)
+	scanner := bufio.NewScanner(c.stdout)
+	scanner.Buffer(make([]byte, min(4096, c.opts.MaxMessageBytes)), c.opts.MaxMessageBytes)
+	var readErr error
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var envelope struct {
+			Type      string          `json:"type"`
+			RequestID string          `json:"request_id"`
+			Request   json.RawMessage `json:"request"`
+			Response  controlReply    `json:"response"`
+		}
+		if err := json.Unmarshal(line, &envelope); err != nil || envelope.Type == "" {
+			readErr = errors.New("claude: invalid stream-json envelope")
+			break
+		}
+		switch envelope.Type {
+		case "control_response":
+			c.mu.Lock()
+			ch := c.pending[envelope.Response.RequestID]
+			c.mu.Unlock()
+			if ch != nil {
+				select {
+				case ch <- envelope.Response:
+				default:
+				}
+			}
+		case "control_request":
+			c.dispatchPermission(envelope.RequestID, bytes.Clone(envelope.Request))
+		case "control_cancel_request":
+			c.mu.Lock()
+			cancel := c.callbacks[envelope.RequestID]
+			c.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+		case "keep_alive":
+		default:
+			var message Message
+			if err := json.Unmarshal(line, &message); err != nil {
+				readErr = fmt.Errorf("claude: decode message: %w", err)
+				break
+			}
+			message.Raw = bytes.Clone(line)
+			select {
+			case c.events <- message:
+			case <-c.ctx.Done():
+				return
+			default:
+				readErr = ErrEventBufferFull
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	if readErr == nil && c.ctx.Err() == nil {
+		if err := scanner.Err(); err != nil {
+			readErr = fmt.Errorf("claude: read stream: %w", err)
+		}
+	}
+	if readErr != nil {
+		c.mu.Lock()
+		c.readErr = readErr
+		c.mu.Unlock()
+		c.cancel(readErr)
+	}
+}
+
+func (c *Client) writeLoop() {
+	defer close(c.writerDone)
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case job := <-c.writes:
+			err := job.ctx.Err()
+			if err == nil {
+				_, err = c.stdin.Write(job.data)
+			}
+			job.done <- err
+			if err != nil && job.ctx.Err() == nil {
+				c.cancel(fmt.Errorf("claude: write stream: %w", err))
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) write(ctx context.Context, value any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.ctx.Err() != nil {
+		return c.closedError()
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("claude: encode message: %w", err)
+	}
+	job := writeJob{data: append(data, '\n'), done: make(chan error, 1), ctx: ctx}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return c.closedError()
+	case c.writes <- job:
+	}
+	select {
+	case err := <-job.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return c.closedError()
+	}
+}
+
+func (c *Client) closedError() error {
+	select {
+	case <-c.done:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.err
+	default:
+		return context.Cause(c.ctx)
+	}
+}
+
+// Send queues a plain text user message. Returning successfully only confirms
+// the write; read through a result message to observe turn completion.
+func (c *Client) Send(ctx context.Context, prompt string) error {
+	content, _ := json.Marshal(prompt)
+	return c.SendMessage(ctx, UserMessage{Content: content})
+}
+
+func (c *Client) SendMessage(ctx context.Context, message UserMessage) error {
+	content := bytes.TrimSpace(message.Content)
+	if !json.Valid(content) || len(content) == 0 || (content[0] != '"' && content[0] != '[') {
+		return fmt.Errorf("claude: user content must be a JSON string or array")
+	}
+	return c.write(ctx, struct {
+		Type    string `json:"type"`
+		Message struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+		SessionID       string  `json:"session_id"`
+		ParentToolUseID *string `json:"parent_tool_use_id"`
+		UUID            string  `json:"uuid,omitempty"`
+	}{Type: "user", Message: struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}{"user", content},
+		SessionID: message.SessionID, ParentToolUseID: message.ParentToolUseID, UUID: message.UUID})
+}
+
+// Receive returns the next native message. Canceling ctx does not interrupt a
+// turn or terminate the process. On process exit it drains queued messages first.
+func (c *Client) Receive(ctx context.Context) (Message, error) {
+	if err := ctx.Err(); err != nil {
+		return Message{}, err
+	}
+	select {
+	case message, ok := <-c.events:
+		if ok {
+			return message, nil
+		}
+		select {
+		case <-c.done:
+			return Message{}, c.closedError()
+		case <-ctx.Done():
+			return Message{}, ctx.Err()
+		}
+	case <-ctx.Done():
+		return Message{}, ctx.Err()
+	}
+}
+
+// Request sends a native SDK control request object, including its subtype, and
+// correlates the response by ID. New CLI controls can be used without SDK changes.
+// Canceling ctx stops waiting; it does not undo an already sent request.
+func (c *Client) Request(ctx context.Context, request any) (json.RawMessage, error) {
+	ctx, stop := context.WithTimeout(ctx, c.opts.ControlTimeout)
+	defer stop()
+	id := "go_" + strconv.FormatUint(c.seq.Add(1), 10)
+	ch := make(chan controlReply, 1)
+	c.mu.Lock()
+	c.pending[id] = ch
+	c.mu.Unlock()
+	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
+	err := c.write(ctx, map[string]any{"type": "control_request", "request_id": id, "request": request})
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case reply := <-ch:
+		if reply.Subtype == "error" {
+			return nil, &ControlError{RequestID: id, Message: reply.Error}
+		}
+		if reply.Subtype != "success" {
+			return nil, fmt.Errorf("claude: invalid control response subtype %q", reply.Subtype)
+		}
+		return reply.Response, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.done:
+		return nil, c.closedError()
+	}
+}
+
+func (c *Client) Interrupt(ctx context.Context) error {
+	_, err := c.Request(ctx, map[string]any{"subtype": "interrupt"})
+	return err
+}
+
+func (c *Client) SetModel(ctx context.Context, model string) error {
+	_, err := c.Request(ctx, map[string]any{"subtype": "set_model", "model": model})
+	return err
+}
+
+func (c *Client) SetPermissionMode(ctx context.Context, mode PermissionMode) error {
+	if _, err := (Options{PermissionMode: mode}).normalized(); err != nil {
+		return err
+	}
+	if mode == "" {
+		return fmt.Errorf("claude: permission mode is required")
+	}
+	_, err := c.Request(ctx, map[string]any{"subtype": "set_permission_mode", "mode": mode})
+	return err
+}
+
+// Close is idempotent, terminates the owned process, and waits for reaping.
+// On Unix it signals the entire process group. On other systems only the direct
+// process is terminated. Close does not wait for misbehaving permission callbacks.
+func (c *Client) Close() error {
+	c.cancel(ErrClosed)
+	<-c.done
+	return nil
+}
+
+// Wait waits for process cleanup. A normal process exit is nil; an explicit
+// Close returns ErrClosed. Receive instead reports io.EOF for normal exit.
+func (c *Client) Wait(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		err := c.closedError()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+}
+
+// Stderr returns the most recent 32 KiB of child stderr. It may contain sensitive
+// information and is intentionally not included in formatted SDK errors.
+func (c *Client) Stderr() string { return c.stderr.String() }
+
+func (c *Client) dispatchPermission(id string, raw json.RawMessage) {
+	ctx, cancel := context.WithTimeout(c.ctx, c.opts.CallbackTimeout)
+	c.mu.Lock()
+	if _, exists := c.callbacks[id]; exists || len(c.callbacks) >= 32 {
+		c.mu.Unlock()
+		cancel()
+		c.cancel(errors.New("claude: duplicate or excessive server control requests"))
+		return
+	}
+	c.callbacks[id] = cancel
+	c.mu.Unlock()
+	go func() {
+		defer cancel()
+		defer func() { c.mu.Lock(); delete(c.callbacks, id); c.mu.Unlock() }()
+		// Run user code separately so a context-ignoring callback cannot hold the
+		// protocol open forever. Such callbacks remain the caller's responsibility.
+		type outcome struct {
+			decision PermissionDecision
+			err      error
+		}
+		completed := make(chan outcome, 1)
+		go func() { decision, err := c.permission(ctx, raw); completed <- outcome{decision, err} }()
+		var result outcome
+		select {
+		case result = <-completed:
+		case <-ctx.Done():
+			// A canceled request has already been abandoned by the CLI.
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return
+			}
+			result.err = ctx.Err()
+		}
+		// Completion and cancellation may become ready at the same time. Never
+		// approve a request whose callback deadline or cancellation already fired.
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			result.err = err
+		}
+		response := map[string]any{"subtype": "success", "request_id": id, "response": result.decision}
+		if result.err != nil {
+			response = map[string]any{"subtype": "error", "request_id": id, "error": "host permission handler failed"}
+		}
+		writeCtx, stop := context.WithTimeout(c.ctx, c.opts.ControlTimeout)
+		defer stop()
+		if err := c.write(writeCtx, map[string]any{"type": "control_response", "response": response}); err != nil && c.ctx.Err() == nil {
+			c.cancel(err)
+		}
+	}()
+}
+
+func (c *Client) permission(ctx context.Context, raw json.RawMessage) (decision PermissionDecision, err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("claude: permission handler panicked")
+		}
+	}()
+	var request struct {
+		Subtype string `json:"subtype"`
+		PermissionRequest
+	}
+	if err = json.Unmarshal(raw, &request); err != nil {
+		return decision, err
+	}
+	if request.Subtype != "can_use_tool" {
+		return decision, fmt.Errorf("claude: unsupported server control %q", request.Subtype)
+	}
+	request.Raw = raw
+	if c.opts.CanUseTool == nil {
+		return PermissionDecision{Behavior: "deny", Message: "No host permission handler configured"}, nil
+	}
+	decision, err = c.opts.CanUseTool(ctx, request.PermissionRequest)
+	if err != nil {
+		return decision, err
+	}
+	if decision.Behavior != "allow" && decision.Behavior != "deny" {
+		return decision, errors.New("claude: permission behavior must be allow or deny")
+	}
+	if decision.Behavior == "allow" && len(decision.UpdatedInput) == 0 {
+		decision.UpdatedInput = request.Input
+	}
+	if decision.Behavior == "allow" && !json.Valid(decision.UpdatedInput) {
+		return decision, errors.New("claude: invalid updated input")
+	}
+	return decision, nil
+}
+
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	const limit = 32 << 10
+	n := len(p)
+	if len(p) >= limit {
+		b.data = append(b.data[:0], p[len(p)-limit:]...)
+	} else {
+		if len(b.data)+len(p) > limit {
+			b.data = b.data[len(b.data)+len(p)-limit:]
+		}
+		b.data = append(b.data, p...)
+	}
+	return n, nil
+}
+
+func (b *tailBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return string(b.data) }
