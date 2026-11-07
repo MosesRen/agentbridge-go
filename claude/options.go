@@ -28,76 +28,62 @@ const (
 // Options configures a single Claude Code process. The zero value is usable.
 // Options and referenced maps/slices must not be mutated after Dial.
 type Options struct {
-	CLIPath                 string    // Defaults to claude on PATH. Must be an executable, not a shell command.
-	Transport               Transport // Optional externally managed protocol transport; CLI flags are not applied to it.
-	Dir                     string
-	Env                     map[string]string // Overrides the inherited environment. Never included in errors.
-	Model                   string
-	SystemPrompt            *string // nil uses an empty SDK prompt, matching upstream. See UseClaudeCodePrompt.
-	AppendSystemPrompt      string
-	Tools                   []string // nil keeps defaults; an empty, non-nil slice disables built-in tools.
-	AllowedTools            []string
-	DisallowedTools         []string
-	PermissionMode          PermissionMode
-	MaxTurns                int
-	MaxBudgetUSD            float64
-	Resume                  string
-	SessionID               string
-	Continue                bool
-	ForkSession             bool
-	NoSessionPersistence    bool
-	IncludePartialMessages  bool
-	SettingSources          []string // nil follows upstream omission; an explicit empty slice sends an empty source list.
-	AddDirs                 []string
-	MCPConfig               json.RawMessage // Native {"mcpServers": {...}} configuration for external servers.
-	StrictMCPConfig         bool
-	JSONSchema              json.RawMessage
-	CanUseTool              PermissionHandler
-	UseClaudeCodePrompt     bool // Opt into the Claude Code preset instead of the empty SDK prompt.
-	SystemPromptFile        string
-	SystemPromptBlocks      []string // Native prompt segments, including the dynamic boundary marker.
-	SystemPromptSnapshot    *bool
-	ExcludeDynamicSections  *bool
-	FallbackModel           string
-	Agent                   string
-	Agents                  map[string]AgentDefinition
-	Betas                   []string
-	Settings                string // Inline JSON object or a settings file path.
-	Sandbox                 *SandboxSettings
-	Plugins                 []PluginConfig
-	Skills                  []string // nil: unspecified; non-nil: explicit skill allowlist, including empty.
-	AllSkills               bool
-	Thinking                *ThinkingConfig
-	Effort                  string
-	TaskBudget              int
-	BudgetLimit             *float64 // Explicit budget, including zero; overrides MaxBudgetUSD.
-	ResumeSessionAt         string
-	ResumeDropsTurn         *string
-	EnableFileCheckpointing bool
-	IncludeHookEvents       bool
-	ForwardSubagentText     bool
-	VerbatimPrompts         bool
-	Bare                    bool
-	Hooks                   map[HookEvent][]HookMatcher
-	SDKServers              map[string]*MCPServer
-	OnElicitation           ElicitationHandler
-	OnUserDialog            UserDialogHandler
-	OnControlRequest        ControlHandler     // Optional handler for newer server-initiated requests.
-	ExtraArgs               map[string]*string // Native flag names without '--'; nil means a boolean flag.
-	RunEndTimeout           time.Duration      // Default 10 minutes between background continuation turns; negative disables.
-	SessionStore            SessionStore
-	LoadTimeout             time.Duration // Default 60s for external store operations.
-	SupportedDialogKinds    []string
-	InitializeOptions       map[string]any // Additional native initialize fields; cannot override SDK-owned fields.
-	mergedSettings          string
-	mergedMCP               json.RawMessage
-	StartupTimeout          time.Duration // Default 60s; bounds initialization, not model execution.
-	ControlTimeout          time.Duration // Default 60s, bounded by the request context.
-	CallbackTimeout         time.Duration // Zero adds no host deadline; native hook deadlines still apply.
-	CloseTimeout            time.Duration // Default 2s before forcibly terminating the process tree.
-	MaxMessageBytes         int           // Default 8 MiB per JSONL record.
-	EventBuffer             int           // Default 0: unbounded. Positive values fail on overflow without dropping events.
-	commandPrefix           []string      // Used by subprocess protocol tests.
+	CLIPath                string    // Defaults to claude on PATH. Must be an executable, not a shell command.
+	Transport              Transport // Optional externally managed protocol transport; CLI flags are not applied to it.
+	Dir                    string
+	Env                    map[string]string // Overrides the inherited environment. Never included in errors.
+	Model                  string
+	SystemPrompt           *string // nil uses an empty SDK prompt, matching upstream. See UseClaudeCodePrompt.
+	AppendSystemPrompt     string
+	Tools                  []string // nil keeps defaults; an empty, non-nil slice disables built-in tools.
+	AllowedTools           []string
+	DisallowedTools        []string
+	PermissionMode         PermissionMode
+	MaxTurns               int
+	MaxBudgetUSD           float64
+	Resume                 string
+	SessionID              string
+	Continue               bool
+	NoSessionPersistence   bool
+	IncludePartialMessages bool
+	SettingSources         []string // nil follows upstream omission; an explicit empty slice sends an empty source list.
+	AddDirs                []string
+	MCPConfig              json.RawMessage // Native {"mcpServers": {...}} configuration for external servers.
+	StrictMCPConfig        bool
+	JSONSchema             json.RawMessage
+	CanUseTool             PermissionHandler
+	UseClaudeCodePrompt    bool // Opt into the Claude Code preset instead of the empty SDK prompt.
+	SystemPromptFile       string
+	FallbackModel          string
+	Agent                  string
+	Agents                 map[string]AgentDefinition
+	Betas                  []string
+	Settings               string // Inline JSON object or a settings file path.
+	Sandbox                *SandboxSettings
+	Plugins                []PluginConfig
+	Skills                 []string // nil: unspecified; non-nil: explicit skill allowlist, including empty.
+	AllSkills              bool
+	Thinking               *ThinkingConfig
+	Effort                 string
+	BudgetLimit            *float64 // Explicit budget, including zero; overrides MaxBudgetUSD.
+	IncludeHookEvents      bool
+	ForwardSubagentText    bool
+	VerbatimPrompts        bool
+	Bare                   bool
+	Hooks                  map[HookEvent][]HookMatcher
+	SDKServers             map[string]*MCPServer
+	ExtraArgs              map[string]*string // Native flag names without '--'; nil means a boolean flag.
+	RunEndTimeout          time.Duration      // Default 10 minutes between background continuation turns; negative disables.
+	InitializeOptions      map[string]any     // Additional native initialize fields; cannot override SDK-owned fields.
+	mergedSettings         string
+	mergedMCP              json.RawMessage
+	StartupTimeout         time.Duration // Default 60s; bounds initialization, not model execution.
+	ControlTimeout         time.Duration // Default 60s, bounded by the request context.
+	CallbackTimeout        time.Duration // Zero adds no host deadline; native hook deadlines still apply.
+	CloseTimeout           time.Duration // Default 2s before forcibly terminating the process tree.
+	MaxMessageBytes        int           // Default 8 MiB per JSONL record.
+	EventBuffer            int           // Default 0: unbounded. Positive values fail on overflow without dropping events.
+	commandPrefix          []string      // Used by subprocess protocol tests.
 }
 
 func (o Options) normalized() (Options, error) {
@@ -109,9 +95,6 @@ func (o Options) normalized() (Options, error) {
 	}
 	if o.Resume != "" && (o.Continue || o.SessionID != "") || o.Continue && o.SessionID != "" {
 		return o, fmt.Errorf("claude: resume, continue, and session ID are mutually exclusive")
-	}
-	if o.ForkSession && o.Resume == "" && !o.Continue {
-		return o, fmt.Errorf("claude: fork requires resume or continue")
 	}
 	for name, value := range map[string]json.RawMessage{"MCPConfig": o.MCPConfig, "JSONSchema": o.JSONSchema} {
 		present := len(value) > 0
@@ -193,9 +176,6 @@ func (o Options) args() []string {
 	if o.Continue {
 		args = append(args, "--continue")
 	}
-	if o.ForkSession {
-		args = append(args, "--fork-session")
-	}
 	if o.NoSessionPersistence {
 		args = append(args, "--no-session-persistence")
 	}
@@ -235,9 +215,6 @@ func (o Options) environment() []string {
 	}
 	values["CLAUDE_CODE_ENTRYPOINT"] = "sdk-go"
 	values["CLAUDE_CODE_SDK_READS_SESSION_STATE"] = "1"
-	if o.EnableFileCheckpointing {
-		values["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true"
-	}
 	for key, value := range o.Env {
 		values[keyName(key)] = value
 	}

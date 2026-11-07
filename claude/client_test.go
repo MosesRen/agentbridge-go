@@ -481,7 +481,7 @@ func TestOptionsAndArgBoundaries(t *testing.T) {
 	if string(data) != `["--flag-like prompt"]` {
 		t.Fatalf("prompt was not bound to initialization: %s", data)
 	}
-	for _, options := range []Options{{MaxTurns: -1}, {EventBuffer: -1}, {Resume: "a", Continue: true}, {ForkSession: true}, {MCPConfig: json.RawMessage(`[]`)}, {PermissionMode: "invalid"}} {
+	for _, options := range []Options{{MaxTurns: -1}, {EventBuffer: -1}, {Resume: "a", Continue: true}, {MCPConfig: json.RawMessage(`[]`)}, {PermissionMode: "invalid"}} {
 		if _, err := options.normalized(); err == nil {
 			t.Errorf("accepted invalid options: %+v", options)
 		}

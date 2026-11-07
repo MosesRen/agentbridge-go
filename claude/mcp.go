@@ -16,14 +16,7 @@ import (
 // or resources/prompts on Server, before sharing it with a Client. Each Client
 // opens its own MCP session, so a definition can be reused across clients.
 type MCPServer struct {
-	Server       *mcp.Server
-	Timeout      time.Duration
-	ToolPolicies []MCPToolPolicy
-}
-type MCPToolPolicy struct {
-	Name             string `json:"name"`
-	PermissionPolicy string `json:"permission_policy,omitempty"`
-	OrgMaxPermission string `json:"org_max_permission,omitempty"`
+	Server *mcp.Server
 }
 
 func NewMCPServer(name, version string) *MCPServer {

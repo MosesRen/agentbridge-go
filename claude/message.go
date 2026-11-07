@@ -124,6 +124,7 @@ type UserMessage struct {
 }
 
 type PermissionRequest struct {
+	RequestID               string          `json:"-"` // SDK control envelope ID, including replayed requests.
 	ToolName                string          `json:"tool_name"`
 	Input                   json.RawMessage `json:"input"`
 	ToolUseID               string          `json:"tool_use_id"`

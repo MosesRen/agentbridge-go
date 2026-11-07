@@ -27,7 +27,7 @@ type runTracker struct {
 
 func newRunTracker(o Options) *runTracker {
 	return &runTracker{done: make(chan struct{}), tasks: map[string]bool{}, ceiling: o.RunEndTimeout,
-		bidirectional: o.CanUseTool != nil || len(o.Hooks) > 0 || len(o.SDKServers) > 0 || o.OnElicitation != nil || o.OnUserDialog != nil || o.OnControlRequest != nil}
+		bidirectional: o.CanUseTool != nil || len(o.Hooks) > 0 || len(o.SDKServers) > 0}
 }
 
 func (r *runTracker) hasBidirectional() bool {
@@ -35,7 +35,6 @@ func (r *runTracker) hasBidirectional() bool {
 	defer r.mu.Unlock()
 	return r.bidirectional
 }
-func (r *runTracker) requireBidirectional() { r.mu.Lock(); r.bidirectional = true; r.mu.Unlock() }
 
 func (r *runTracker) finishLocked() {
 	if !r.finished {

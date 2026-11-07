@@ -29,6 +29,10 @@ func Query(ctx context.Context, prompt string, options Options) (*Stream, error)
 		_ = client.Close()
 		return nil, err
 	}
+	return singleTurnStream(client), nil
+}
+
+func singleTurnStream(client *Client) *Stream {
 	go func() {
 		if client.run.hasBidirectional() {
 			if client.run.wait(client.ctx) != nil {
@@ -43,8 +47,11 @@ func Query(ctx context.Context, prompt string, options Options) (*Stream, error)
 			}
 		}
 	}()
-	return &Stream{client: client}, nil
+	return &Stream{client: client}
 }
+
+// Client exposes the stream's native controls without starting another process.
+func (s *Stream) Client() *Client { return s.client }
 
 func (s *Stream) Next(ctx context.Context) (Message, error) {
 	if s.ended {

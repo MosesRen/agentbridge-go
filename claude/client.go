@@ -21,11 +21,21 @@ import (
 // must respect ctx, and may call client control methods (but must not call Close).
 type PermissionHandler func(ctx context.Context, request PermissionRequest) (PermissionDecision, error)
 
+type controlRequestIDKey struct{}
+
+// ControlRequestID returns the envelope ID inside a server-initiated callback.
+// It is also available as PermissionRequest.RequestID for permission handlers.
+func ControlRequestID(ctx context.Context) string {
+	id, _ := ctx.Value(controlRequestIDKey{}).(string)
+	return id
+}
+
 type controlReply struct {
 	Subtype   string          `json:"subtype"`
 	RequestID string          `json:"request_id"`
 	Response  json.RawMessage `json:"response"`
 	Error     string          `json:"error"`
+	ErrorCode string          `json:"error_code"`
 }
 
 type writeJob struct {
@@ -61,14 +71,10 @@ type Client struct {
 	stderr         tailBuffer
 	initialization json.RawMessage
 	hooks          map[string]hookRegistration
-	initRequest    map[string]any
 	bridgeMu       sync.Mutex
-	serverUpdateMu sync.Mutex
-	serverConfigs  map[string]json.RawMessage
 	bridges        map[string]*mcpBridge
 	run            *runTracker
 	inputClosed    atomic.Bool
-	resumeCleanup  func()
 }
 
 // Dial starts Claude Code and completes the SDK initialize handshake. ctx owns
@@ -81,25 +87,13 @@ func Dial(ctx context.Context, options Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	opts, cleanup, err := materializeStoreResume(ctx, opts)
-	if err != nil {
-		return nil, err
-	}
-	success := false
-	defer func() {
-		if !success {
-			cleanup()
-		}
-	}()
 	processCtx, cancel := context.WithCancelCause(ctx)
 	c := &Client{opts: opts, ctx: processCtx, cancel: cancel,
 		done: make(chan struct{}), exited: make(chan struct{}), readerDone: make(chan struct{}), writerDone: make(chan struct{}),
 		events: newMessageQueue(opts.EventBuffer), writes: make(chan writeJob),
 		pending: make(map[string]chan controlReply), callbacks: make(map[string]context.CancelFunc), bridges: make(map[string]*mcpBridge)}
 	c.run = newRunTracker(c.opts)
-	c.resumeCleanup = cleanup
-	c.initRequest = c.initializeRequest()
-	c.serverConfigs = initialMCPConfigs(opts)
+	initialize := c.initializeRequest()
 	if opts.Transport != nil {
 		c.stdout = &transportReader{ctx: c.ctx, transport: opts.Transport}
 		go c.readLoop()
@@ -143,15 +137,17 @@ func Dial(ctx context.Context, options Options) (*Client, error) {
 	}
 	initCtx, stop := context.WithTimeout(ctx, opts.StartupTimeout)
 	defer stop()
-	c.initialization, err = c.request(initCtx, c.initRequest, opts.StartupTimeout)
+	initialization, err := c.request(initCtx, initialize, opts.StartupTimeout)
 	if err == nil {
-		err = c.checkInitialization(c.initialization)
+		err = c.checkInitialization(initialization)
+		c.mu.Lock()
+		c.initialization = initialization
+		c.mu.Unlock()
 	}
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("claude: initialize: %w", err)
 	}
-	success = true
 	return c, nil
 }
 
@@ -160,16 +156,6 @@ func (c *Client) Initialization() json.RawMessage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return bytes.Clone(c.initialization)
-}
-
-func (c *Client) currentInitializeRequest() map[string]any {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	request := make(map[string]any, len(c.initRequest))
-	for key, value := range c.initRequest {
-		request[key] = value
-	}
-	return request
 }
 
 func (c *Client) supervise() {
@@ -221,7 +207,6 @@ func (c *Client) supervise() {
 	c.cancel(ErrClosed)
 	c.run.close()
 	c.closeMCP()
-	c.resumeCleanup()
 	<-c.writerDone
 	close(c.done)
 }
@@ -229,6 +214,7 @@ func (c *Client) supervise() {
 func (c *Client) readLoop() {
 	defer close(c.readerDone)
 	defer c.events.close()
+
 	scanner := bufio.NewScanner(c.stdout)
 	scanner.Buffer(make([]byte, min(4096, c.opts.MaxMessageBytes)), c.opts.MaxMessageBytes)
 	var readErr error
@@ -266,13 +252,6 @@ func (c *Client) readLoop() {
 			c.mu.Unlock()
 			if cancel != nil {
 				cancel()
-			}
-		case "transcript_mirror":
-			if err := c.mirror(line); err != nil {
-				data, _ := json.Marshal(map[string]any{"type": "system", "subtype": "mirror_error", "error": "session store append failed"})
-				if err := c.events.push(Message{Type: "system", Subtype: "mirror_error", Raw: data}); err != nil {
-					readErr = err
-				}
 			}
 		case "keep_alive", "keep-alive", "keep_alive_ping":
 		default:
@@ -455,7 +434,7 @@ func (c *Client) Receive(ctx context.Context) (Message, error) {
 
 // Request sends a native SDK control request object, including its subtype, and
 // correlates the response by ID. New CLI controls can be used without SDK changes.
-// Canceling ctx stops waiting; it does not undo an already sent request.
+// Canceling ctx sends control_cancel_request. It cannot undo completed work.
 func (c *Client) Request(ctx context.Context, request any) (json.RawMessage, error) {
 	return c.request(ctx, request, c.opts.ControlTimeout)
 }
@@ -469,24 +448,33 @@ func (c *Client) request(ctx context.Context, request any, timeout time.Duration
 	c.pending[id] = ch
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
-	err := c.write(ctx, map[string]any{"type": "control_request", "request_id": id, "request": request})
-	if err != nil {
+	if err := c.write(ctx, map[string]any{"type": "control_request", "request_id": id, "request": request}); err != nil {
 		return nil, err
 	}
+	var reply controlReply
 	select {
-	case reply := <-ch:
-		if reply.Subtype == "error" {
-			return nil, &ControlError{RequestID: id, Message: reply.Error}
-		}
-		if reply.Subtype != "success" {
-			return nil, fmt.Errorf("claude: invalid control response subtype %q", reply.Subtype)
-		}
-		return reply.Response, nil
+	case reply = <-ch:
 	case <-ctx.Done():
+		go func() {
+			cancelCtx, cancel := context.WithTimeout(c.ctx, c.opts.ControlTimeout)
+			defer cancel()
+			_ = c.write(cancelCtx, map[string]any{"type": "control_cancel_request", "request_id": id})
+		}()
 		return nil, ctx.Err()
 	case <-c.done:
-		return nil, c.closedError()
+		select {
+		case reply = <-ch:
+		default:
+			return nil, c.closedError()
+		}
 	}
+	if reply.Subtype == "error" {
+		return nil, &ControlError{RequestID: id, Message: reply.Error, Code: reply.ErrorCode}
+	}
+	if reply.Subtype != "success" {
+		return nil, fmt.Errorf("claude: invalid control response subtype %q", reply.Subtype)
+	}
+	return reply.Response, nil
 }
 
 // EndInput closes stdin after preceding writes; output continues until CLI exit.
@@ -562,6 +550,9 @@ func (c *Client) Wait(ctx context.Context) error {
 func (c *Client) Stderr() string { return c.stderr.String() }
 
 func (c *Client) dispatchPermission(id string, raw json.RawMessage) {
+	if c.ctx.Err() != nil {
+		return
+	}
 	duration := c.opts.CallbackTimeout
 	var request struct {
 		Subtype    string `json:"subtype"`
@@ -578,6 +569,7 @@ func (c *Client) dispatchPermission(id string, raw json.RawMessage) {
 		cancel()
 		ctx, cancel = context.WithTimeout(c.ctx, duration)
 	}
+	ctx = context.WithValue(ctx, controlRequestIDKey{}, id)
 	c.mu.Lock()
 	if _, exists := c.callbacks[id]; exists {
 		c.mu.Unlock()
@@ -644,6 +636,7 @@ func (c *Client) permission(ctx context.Context, raw json.RawMessage) (decision 
 		return decision, fmt.Errorf("claude: unsupported server control %q", request.Subtype)
 	}
 	request.Raw = raw
+	request.RequestID = ControlRequestID(ctx)
 	if c.opts.CanUseTool == nil {
 		return PermissionDecision{Behavior: "deny", Message: "No host permission handler configured"}, nil
 	}

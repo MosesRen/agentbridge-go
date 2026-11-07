@@ -54,29 +54,14 @@ var skillNamePattern = regexp.MustCompile(`[(),\x00-\x1f\x7f-\x9f\x{feff}]`)
 var flagNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]*$`)
 
 func (o Options) extendedDefaults() (Options, error) {
-	if o.LoadTimeout == 0 {
-		o.LoadTimeout = 60 * time.Second
-	}
-	if o.LoadTimeout < 0 {
-		return o, fmt.Errorf("claude: negative store timeout")
-	}
-	if o.SessionStore != nil && o.NoSessionPersistence {
-		return o, fmt.Errorf("claude: session store requires session persistence and transcript mirroring")
-	}
 	if o.RunEndTimeout == 0 {
 		o.RunEndTimeout = 10 * time.Minute
 	}
 	if o.BudgetLimit != nil && (*o.BudgetLimit < 0 || math.IsNaN(*o.BudgetLimit) || math.IsInf(*o.BudgetLimit, 0)) {
 		return o, fmt.Errorf("claude: invalid budget limit")
 	}
-	if o.TaskBudget < 0 {
-		return o, fmt.Errorf("claude: task budget cannot be negative")
-	}
 	if o.SystemPromptFile != "" && (o.SystemPrompt != nil || o.UseClaudeCodePrompt) || o.SystemPrompt != nil && o.UseClaudeCodePrompt {
 		return o, fmt.Errorf("claude: prompt text, file and preset are mutually exclusive")
-	}
-	if o.SystemPromptBlocks != nil && (o.SystemPromptFile != "" || o.SystemPrompt != nil || o.UseClaudeCodePrompt) {
-		return o, fmt.Errorf("claude: prompt blocks conflict with prompt text, file or preset")
 	}
 	if o.AllSkills && o.Skills != nil {
 		return o, fmt.Errorf("claude: Skills and AllSkills are mutually exclusive")
@@ -211,7 +196,7 @@ func appendUnique(values []string, value string) []string {
 func (o Options) extendedArgs() []string {
 	var args []string
 	add := func(flag, value string) { args = append(args, "--"+flag+"="+value) }
-	for _, pair := range [][2]string{{"fallback-model", o.FallbackModel}, {"agent", o.Agent}, {"effort", o.Effort}, {"resume-session-at", o.ResumeSessionAt}} {
+	for _, pair := range [][2]string{{"fallback-model", o.FallbackModel}, {"agent", o.Agent}, {"effort", o.Effort}} {
 		if pair[1] != "" {
 			add(pair[0], pair[1])
 		}
@@ -221,12 +206,6 @@ func (o Options) extendedArgs() []string {
 	}
 	if o.mergedSettings != "" {
 		add("settings", o.mergedSettings)
-	}
-	if o.TaskBudget > 0 {
-		add("task-budget", strconv.Itoa(o.TaskBudget))
-	}
-	if o.ResumeDropsTurn != nil {
-		add("resume-drops-turn", *o.ResumeDropsTurn)
 	}
 	if o.Thinking != nil {
 		if o.Thinking.Type == "enabled" {
@@ -241,14 +220,8 @@ func (o Options) extendedArgs() []string {
 	if o.IncludeHookEvents {
 		args = append(args, "--include-hook-events")
 	}
-	if o.EnableFileCheckpointing {
-		args = append(args, "--replay-user-messages")
-	}
 	if o.Bare {
 		args = append(args, "--bare")
-	}
-	if o.SessionStore != nil {
-		args = append(args, "--session-mirror")
 	}
 	for _, plugin := range o.Plugins {
 		flag := "plugin-dir"

@@ -1,0 +1,32 @@
+name: Bug report / 缺陷报告
+description: Report a reproducible SDK problem / 报告可复现的 SDK 问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities, follow SECURITY.md instead. Remove credentials and private transcripts. / 安全漏洞按 SECURITY.md 处理，请移除凭据和私人会话。"
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment / 环境
+      description: Module commit/version, Go version, OS/architecture, and agent CLI version. / 模块提交或版本、Go 版本、系统架构和 CLI 版本。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproducer / 最小复现
+      description: Include sanitized code, options, and steps. / 提供脱敏代码、选项和步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Expected and actual behavior / 预期与实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized errors or logs / 脱敏错误或日志
+      description: Logs may contain prompts, paths, or secrets; inspect them first. / 日志可能包含提示词、路径或密钥，请先检查。

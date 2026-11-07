@@ -1,0 +1,21 @@
+name: Feature request / 功能建议
+description: Propose a focused capability / 建议一项明确能力
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case / 问题与使用场景
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / 期望行为
+      description: Explain the API and why it fits the current core scope. / 说明 API 和它与当前核心范围的关系。
+    validations:
+      required: true
+  - type: textarea
+    id: reference
+    attributes:
+      label: Upstream reference or alternatives / 上游依据或替代方案

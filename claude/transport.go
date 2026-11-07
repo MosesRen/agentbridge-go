@@ -58,7 +58,6 @@ func (c *Client) superviseTransport() {
 	<-c.writerDone
 	c.run.close()
 	c.closeMCP()
-	c.resumeCleanup()
 	close(c.exited)
 	close(c.done)
 }

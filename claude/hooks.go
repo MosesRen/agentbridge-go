@@ -102,8 +102,6 @@ func (c *Client) initializeRequest() map[string]any {
 	if c.opts.SystemPromptFile == "" {
 		if c.opts.SystemPrompt != nil {
 			request["systemPrompt"] = []string{*c.opts.SystemPrompt}
-		} else if c.opts.SystemPromptBlocks != nil {
-			request["systemPrompt"] = c.opts.SystemPromptBlocks
 		} else if !c.opts.UseClaudeCodePrompt {
 			request["systemPrompt"] = []string{""}
 		}
@@ -152,12 +150,6 @@ func (c *Client) initializeRequest() map[string]any {
 	if c.opts.ForwardSubagentText {
 		request["forwardSubagentText"] = true
 	}
-	if c.opts.ExcludeDynamicSections != nil {
-		request["excludeDynamicSections"] = *c.opts.ExcludeDynamicSections
-	}
-	if c.opts.SystemPromptSnapshot != nil {
-		request["systemPromptSnapshot"] = *c.opts.SystemPromptSnapshot
-	}
 	if len(c.opts.SDKServers) > 0 {
 		names := make([]string, 0, len(c.opts.SDKServers))
 		for name := range c.opts.SDKServers {
@@ -165,25 +157,7 @@ func (c *Client) initializeRequest() map[string]any {
 		}
 		sort.Strings(names)
 		request["sdkMcpServers"] = names
-		configs := map[string]any{}
-		for name, server := range c.opts.SDKServers {
-			config := map[string]any{}
-			if server.Timeout > 0 {
-				config["timeout"] = server.Timeout.Milliseconds()
-			}
-			if server.ToolPolicies != nil {
-				config["tools"] = server.ToolPolicies
-			}
-			if len(config) > 0 {
-				configs[name] = config
-			}
-		}
-		if len(configs) > 0 {
-			request["sdkMcpServerConfigs"] = configs
-		}
-	}
-	if c.opts.SupportedDialogKinds != nil {
-		request["supportedDialogKinds"] = c.opts.SupportedDialogKinds
+
 	}
 	for key, value := range c.opts.InitializeOptions {
 		if _, owned := request[key]; !owned {
@@ -217,16 +191,6 @@ func (c *Client) checkInitialization(data json.RawMessage) error {
 	}
 	return nil
 }
-
-// ControlHandler handles a native server request not covered by a typed handler.
-// The returned value is placed inside the control success response.
-type ControlHandler func(context.Context, json.RawMessage) (any, error)
-type ElicitationHandler func(context.Context, json.RawMessage) (ElicitationResult, error)
-type ElicitationResult struct {
-	Action  string         `json:"action"` // accept, decline, cancel
-	Content map[string]any `json:"content,omitempty"`
-}
-type UserDialogHandler func(context.Context, json.RawMessage) (json.RawMessage, error)
 
 func (c *Client) serverControl(ctx context.Context, raw json.RawMessage) (response any, err error) {
 	defer func() {
@@ -275,22 +239,6 @@ func (c *Client) serverControl(ctx context.Context, raw json.RawMessage) (respon
 			return nil, err
 		}
 		return map[string]any{"mcp_response": response}, nil
-	case "elicitation":
-		if c.opts.OnElicitation == nil {
-			return ElicitationResult{Action: "cancel"}, nil
-		}
-		result, err := c.opts.OnElicitation(ctx, raw)
-		if result.Action != "accept" && result.Action != "decline" && result.Action != "cancel" {
-			return nil, fmt.Errorf("claude: invalid elicitation action")
-		}
-		return result, err
-	case "request_user_dialog":
-		if c.opts.OnUserDialog != nil {
-			return c.opts.OnUserDialog(ctx, raw)
-		}
-	}
-	if c.opts.OnControlRequest != nil {
-		return c.opts.OnControlRequest(ctx, raw)
 	}
 	return nil, fmt.Errorf("claude: unsupported server control %q", request.Subtype)
 }

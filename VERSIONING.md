@@ -1,11 +1,23 @@
-# 版本管理
+# Versioning
 
-一个仓库、每个 Go module 独立发版。Claude 的 module 路径是 `github.com/MosesRen/agentbridge-go/claude`，发布标签使用 `claude/vX.Y.Z`，后续其他 agent 使用各自的模块前缀。
+English | [简体中文](VERSIONING.zh-CN.md)
 
-- patch：兼容性修复，不改变 Go API。
-- minor：增加功能；在 v0 阶段，不兼容变更也升 minor，并写明迁移方式。
-- v1 之后的不兼容变更：升级 major，并按 Go 规范变更 module/import 路径。
+Each Go module is versioned independently in this repository. The Claude module is `github.com/MosesRen/agentbridge-go/claude`, with release tags named **`claude/vX.Y.Z`**. Future modules use their own directory prefixes.
 
-Go module 版本和上游 SDK/CLI 版本分开记录。上游兼容基准放在各模块的 `baseline.go` 和 `COMPATIBILITY.md`，不把上游版本直接当作本项目版本。
+- **Patch:** compatible fixes, without Go API changes.
+- **Minor:** added functionality. Before v1, breaking changes also require a minor increment and migration notes.
+- **Major:** after v1, breaking changes require a new major version and the Go module/import-path suffix required by Go.
 
-发布前执行模块测试、竞态检测、静态检查和所涉及的兼容测试。仅在明确发布时创建模块标签；普通提交不自动发版。
+Go module versions are independent of upstream SDK and CLI versions. Capability references and protocol-test baselines are recorded in each module's `baseline.go` and `COMPATIBILITY.md`. A reference version does not promise complete API parity.
+
+Development installs may use `@main`; applications should pin the resolved pseudo-version or a release tag. A commit/push does not automatically create a release or tag.
+
+Before publishing a module release:
+
+1. Run the relevant module tests, race checks, static checks, and compatibility comparisons.
+2. Run live tests when native protocol behavior changed; record their service/platform requirements.
+3. Update both language versions of the affected documentation and the changelog.
+4. Check the module's third-party notices and license files. The root `LICENSE` applies to all modules; Go includes it in nested-module archives when no module-local `LICENSE` exists.
+5. Create a module-prefixed tag only when a release is explicitly requested.
+
+See the [Go module reference](https://go.dev/ref/mod#vcs-license) for nested-module license handling.

@@ -39,6 +39,6 @@ func (e *ProcessError) Error() string {
 }
 func (e *ProcessError) Unwrap() error { return e.Err }
 
-type ControlError struct{ RequestID, Message string }
+type ControlError struct{ RequestID, Message, Code string }
 
 func (e *ControlError) Error() string { return "claude: control request failed: " + e.Message }
